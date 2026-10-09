@@ -4,298 +4,280 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="AI Forex Lab v2", page_icon="📈", layout="wide")
+st.set_page_config(page_title="AI Forex Trader — Test Dashboard", page_icon="📈", layout="wide")
 
 PAIRS = {
-    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X", "NZD/USD": "NZDUSD=X",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
+    "NZD/USD": "NZDUSD=X",
 }
 INTERVALS = {
-    "5 minutes": ("5m", "5d"), "15 minutes": ("15m", "60d"),
-    "1 hour": ("60m", "730d"), "1 day": ("1d", "5y"),
+    "5 minutes": ("5m", "5d"),
+    "15 minutes": ("15m", "60d"),
+    "1 hour": ("60m", "730d"),
+    "1 day": ("1d", "5y"),
 }
 
-st.title("📈 AI Forex Lab — Version 2")
-st.caption("Mobile-friendly research prototype • paper trading only • no live broker orders")
-st.warning(
-    "This is an experimental research tool, not a validated or profitable trading system. "
-    "It does not place live trades. Market data may be delayed or incomplete. Backtests are simulations."
-)
 
-def fetch_data(symbol, interval, period):
-    try:
-        df = yf.download(symbol, interval=interval, period=period, auto_adjust=False,
-                         progress=False, threads=False)
-    except Exception:
-        return pd.DataFrame()
+def fetch_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    df = yf.download(ticker, interval=interval, period=period, auto_adjust=False, progress=False, threads=False)
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df.columns = [str(c).title() for c in df.columns]
-    required = ["Open", "High", "Low", "Close"]
-    if not all(c in df.columns for c in required):
+    needed = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+    if len(needed) != 4:
         return pd.DataFrame()
-    return df[required].dropna()
+    df = df[needed].copy()
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna().sort_index()
 
-def calc_indicators(df, fast, slow, adx_period, atr_period):
-    x = df.copy()
-    x["SMA_Fast"] = x["Close"].rolling(fast).mean()
-    x["SMA_Slow"] = x["Close"].rolling(slow).mean()
-    prev = x["Close"].shift(1)
-    tr = pd.concat([(x["High"] - x["Low"]), (x["High"] - prev).abs(),
-                    (x["Low"] - prev).abs()], axis=1).max(axis=1)
-    x["TR"] = tr
-    x["ATR"] = tr.rolling(atr_period).mean()
-    up = x["High"].diff()
-    down = -x["Low"].diff()
+
+def indicators(df: pd.DataFrame, fast: int, slow: int, atr_period: int, adx_period: int) -> pd.DataFrame:
+    out = df.copy()
+    out["SMA_fast"] = out["Close"].rolling(fast).mean()
+    out["SMA_slow"] = out["Close"].rolling(slow).mean()
+    prev_close = out["Close"].shift(1)
+    tr = pd.concat([
+        out["High"] - out["Low"],
+        (out["High"] - prev_close).abs(),
+        (out["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    out["ATR"] = tr.rolling(atr_period).mean()
+    up = out["High"].diff()
+    down = -out["Low"].diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
-    smoothed_tr = tr.rolling(adx_period).mean().replace(0, np.nan)
-    plus_di = 100 * plus_dm.rolling(adx_period).mean() / smoothed_tr
-    minus_di = 100 * minus_dm.rolling(adx_period).mean() / smoothed_tr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    x["ADX"] = dx.rolling(adx_period).mean()
-    return x
+    atr_adx = tr.rolling(adx_period).mean().replace(0, np.nan)
+    plus_di = 100 * plus_dm.rolling(adx_period).mean() / atr_adx
+    minus_di = 100 * minus_dm.rolling(adx_period).mean() / atr_adx
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / denom
+    out["ADX"] = dx.rolling(adx_period).mean()
+    return out
 
-def signals(x, adx_floor):
-    long = (x["SMA_Fast"] > x["SMA_Slow"]) & (x["ADX"] >= adx_floor)
-    short = (x["SMA_Fast"] < x["SMA_Slow"]) & (x["ADX"] >= adx_floor)
-    return pd.Series(np.select([long, short], [1, -1], default=0), index=x.index, name="Signal")
 
-def simulate(df, initial_cash, risk_pct, stop_atr, target_r, spread_pips, pip_size,
-             daily_loss_limit_pct, max_drawdown_pct):
-    """
-    Transparent OHLC-bar simulation. Uses next-bar open for entries and checks stop/target
-    against each bar's high/low. If both stop and target are touched in one bar, assumes
-    the stop happened first (conservative). This still omits real execution details.
-    """
-    x = df.copy()
+def quote_to_usd_factor(pair: str, price: float) -> float:
+    """USD value of one unit of quote currency, approximated from the pair price."""
+    return (1.0 / price) if pair.startswith("USD/") and price > 0 else 1.0
+
+
+def run_backtest(df: pd.DataFrame, pair: str, initial_cash: float, risk_pct: float,
+                 fast: int, slow: int, adx_min: float, atr_stop: float,
+                 reward_risk: float, spread_pips: float, pip_size: float,
+                 max_daily_loss_pct: float, max_drawdown_pct: float) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    data = df.copy().dropna(subset=["Open", "High", "Low", "Close", "SMA_fast", "SMA_slow", "ATR", "ADX"])
+    if len(data) < 3:
+        return pd.DataFrame(), pd.DataFrame(), {"error": "Not enough candles after indicators. Try a longer interval/history."}
+
+    # A signal is calculated at candle close and an order is simulated at the next candle open.
+    data["signal"] = 0
+    data.loc[(data["SMA_fast"] > data["SMA_slow"]) & (data["ADX"] >= adx_min), "signal"] = 1
+    data.loc[(data["SMA_fast"] < data["SMA_slow"]) & (data["ADX"] >= adx_min), "signal"] = -1
+
     cash = float(initial_cash)
-    equity = cash
-    peak_equity = cash
-    daily_start_equity = cash
-    current_day = None
-    halted = False
-    side = 0
-    units = 0.0
-    entry = stop = target = None
-    entry_time = None
+    position = None
     trades = []
-    curve = []
-    fee_rate = (spread_pips * pip_size)
+    equity_rows = []
+    peak_equity = cash
+    current_day = None
+    day_start_equity = cash
+    daily_paused = False
+    drawdown_paused = False
+    spread = float(spread_pips) * float(pip_size)
 
-    for i in range(1, len(x)):
-        ts = x.index[i]
-        bar = x.iloc[i]
-        prev_sig = int(x["Signal"].iloc[i-1]) if pd.notna(x["Signal"].iloc[i-1]) else 0
-        o, h, l, c = map(float, [bar["Open"], bar["High"], bar["Low"], bar["Close"]])
-        atr = float(x["ATR"].iloc[i-1]) if pd.notna(x["ATR"].iloc[i-1]) else np.nan
-        day = pd.Timestamp(ts).date()
+    def marked_equity(mark_price: float) -> float:
+        if position is None:
+            return cash
+        quote_pnl = position["side"] * position["units"] * (mark_price - position["entry"])
+        return cash + quote_pnl * quote_to_usd_factor(pair, mark_price)
 
-        if day != current_day:
+    rows = list(data.iterrows())
+    for i, (timestamp, row) in enumerate(rows):
+        price = float(row["Open"])
+        day = pd.Timestamp(timestamp).date()
+        if current_day != day:
             current_day = day
-            daily_start_equity = equity
-            # Daily halt resets on the next data date; this is only a historical simulation.
-            halted = False
+            day_start_equity = marked_equity(price)
+            daily_paused = False
 
-        # Mark-to-market equity for an open position at bar close.
-        unrealized = side * units * (c - entry) if side and entry is not None else 0.0
-        equity = cash + unrealized
-        peak_equity = max(peak_equity, equity)
-        daily_loss = (equity / daily_start_equity - 1) if daily_start_equity else 0.0
-        drawdown = (equity / peak_equity - 1) if peak_equity else 0.0
-        if daily_loss <= -daily_loss_limit_pct / 100 or drawdown <= -max_drawdown_pct / 100:
-            halted = True
-
-        # Check protective exits on current bar.
-        if side != 0:
-            exit_price = None
-            exit_reason = None
-            if side == 1:
-                stop_hit = l <= stop
-                target_hit = h >= target
-            else:
-                stop_hit = h >= stop
-                target_hit = l <= target
+        # Exits are checked against the full candle range. If stop and target both hit,
+        # assume the stop was hit first (conservative, but still only an approximation).
+        if position is not None:
+            hi, lo = float(row["High"]), float(row["Low"])
+            stop_hit = lo <= position["stop"] if position["side"] == 1 else hi >= position["stop"]
+            target_hit = hi >= position["target"] if position["side"] == 1 else lo <= position["target"]
+            exit_price, reason = None, None
             if stop_hit:
-                exit_price, exit_reason = stop, "Stop loss"
+                exit_price, reason = position["stop"], "Stop loss"
             elif target_hit:
-                exit_price, exit_reason = target, "Take profit"
-            elif prev_sig == -side:
-                exit_price, exit_reason = o, "Opposite signal"
+                exit_price, reason = position["target"], "Take profit"
+            elif i == len(rows) - 1:
+                exit_price, reason = float(row["Close"]), "End of data"
+            # Reverse signal exits at this candle's open; signal is from previous candle.
+            elif i > 0 and int(data["signal"].iloc[i - 1]) == -position["side"]:
+                exit_price, reason = price, "Opposite signal"
             if exit_price is not None:
-                # Adverse spread approximation on exit.
-                exit_price = exit_price - fee_rate if side == 1 else exit_price + fee_rate
-                pnl = side * units * (exit_price - entry)
-                cash += pnl
+                # Spread is charged on entry and exit in quote currency.
+                effective_exit = exit_price - position["side"] * spread
+                quote_pnl = position["side"] * position["units"] * (effective_exit - position["entry_effective"])
+                pnl_usd = quote_pnl * quote_to_usd_factor(pair, max(effective_exit, 1e-12))
+                cash += pnl_usd
                 trades.append({
-                    "Entry time": entry_time, "Exit time": ts, "Side": "Long" if side == 1 else "Short",
-                    "Units": round(units, 2), "Entry": entry, "Exit": exit_price,
-                    "P&L ($)": pnl, "Exit reason": exit_reason,
-                    "Return on risk budget (%)": (pnl / max(abs(entry-stop)*units, 1e-12))*100
+                    "Entry time": position["entry_time"], "Exit time": timestamp,
+                    "Pair": pair, "Side": "LONG" if position["side"] == 1 else "SHORT",
+                    "Units": round(position["units"], 2), "Entry": position["entry"],
+                    "Exit": exit_price, "P&L (USD)": pnl_usd, "Reason": reason,
+                    "Equity after trade": cash,
                 })
-                side, units, entry, stop, target, entry_time = 0, 0.0, None, None, None, None
-                equity = cash
-                peak_equity = max(peak_equity, equity)
-                drawdown = equity / peak_equity - 1 if peak_equity else 0
+                position = None
 
-        # Enter at current bar open using signal from prior completed bar.
-        if side == 0 and not halted and prev_sig != 0 and np.isfinite(atr) and atr > 0:
-            entry = o + fee_rate if prev_sig == 1 else o - fee_rate
-            stop_distance = stop_atr * atr
-            risk_cash = max(0.0, cash * risk_pct / 100)
-            units = risk_cash / stop_distance if stop_distance > 0 else 0.0
-            if units > 0:
-                side = prev_sig
-                stop = entry - side * stop_distance
-                target = entry + side * stop_distance * target_r
-                entry_time = ts
-        unrealized = side * units * (c - entry) if side and entry is not None else 0.0
-        equity = cash + unrealized
-        peak_equity = max(peak_equity, equity)
-        curve.append({"Time": ts, "Equity": equity, "Cash": cash,
-                      "Drawdown %": (equity / peak_equity - 1) * 100 if peak_equity else 0,
-                      "Open side": side, "Open units": units, "Close": c})
-    curve_df = pd.DataFrame(curve).set_index("Time") if curve else pd.DataFrame()
-    return curve_df, pd.DataFrame(trades), cash, side, units, entry, stop, target
+        equity_now = marked_equity(float(row["Close"]))
+        peak_equity = max(peak_equity, equity_now)
+        drawdown_pct = (peak_equity - equity_now) / peak_equity * 100 if peak_equity > 0 else 0
+        daily_loss_pct = (day_start_equity - equity_now) / day_start_equity * 100 if day_start_equity > 0 else 0
+        if daily_loss_pct >= max_daily_loss_pct:
+            daily_paused = True
+        if drawdown_pct >= max_drawdown_pct:
+            drawdown_paused = True
+
+        # New positions use the previous completed candle's signal and ATR.
+        if position is None and i > 0 and not daily_paused and not drawdown_paused:
+            sig = int(data["signal"].iloc[i - 1])
+            prior_atr = float(data["ATR"].iloc[i - 1])
+            if sig != 0 and np.isfinite(prior_atr) and prior_atr > 0:
+                stop_distance = prior_atr * atr_stop
+                risk_cash = max(0.0, cash) * risk_pct / 100.0
+                risk_per_unit_usd = stop_distance * quote_to_usd_factor(pair, price)
+                units = risk_cash / risk_per_unit_usd if risk_per_unit_usd > 0 else 0.0
+                # Prevent nonsensical sizing from corrupt/near-zero prices.
+                if np.isfinite(units) and units > 0 and units < 1e12:
+                    entry_effective = price + sig * spread
+                    position = {
+                        "side": sig, "units": units, "entry": price,
+                        "entry_effective": entry_effective, "entry_time": timestamp,
+                        "stop": price - sig * stop_distance,
+                        "target": price + sig * stop_distance * reward_risk,
+                    }
+        equity_rows.append({"Time": timestamp, "Equity": marked_equity(float(row["Close"])),
+                            "Close": float(row["Close"]), "Signal": int(row["signal"])})
+
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity_rows).set_index("Time") if equity_rows else pd.DataFrame()
+    final_equity = float(equity_df["Equity"].iloc[-1]) if not equity_df.empty else cash
+    if not trades_df.empty:
+        wins = int((trades_df["P&L (USD)"] > 0).sum())
+        losses = int((trades_df["P&L (USD)"] <= 0).sum())
+        win_rate = 100 * wins / len(trades_df)
+        net_profit = float(trades_df["P&L (USD)"].sum())
+    else:
+        wins = losses = 0
+        win_rate = 0.0
+        net_profit = 0.0
+    eq = equity_df["Equity"] if not equity_df.empty else pd.Series([initial_cash])
+    dd = ((eq.cummax() - eq) / eq.cummax().replace(0, np.nan) * 100).max()
+    stats = {"Initial balance": initial_cash, "Final equity": final_equity,
+             "Net profit (closed trades)": net_profit, "Return %": (final_equity / initial_cash - 1) * 100 if initial_cash else 0,
+             "Trades": len(trades_df), "Wins": wins, "Losses": losses, "Win rate %": win_rate,
+             "Max observed drawdown %": float(dd) if pd.notna(dd) else 0.0,
+             "Trading paused by drawdown limit": drawdown_paused}
+    return trades_df, equity_df, stats
+
+
+st.title("📈 Forex Strategy Test Dashboard")
+st.warning("TEST MODE ONLY — this app does not place broker orders and does not contain a trained AI. Market data from Yahoo Finance can be delayed, incomplete, or inaccurate. Backtests are simplified simulations, not proof of future profitability. Do not use real money based on these results.")
 
 with st.sidebar:
-    st.header("Settings")
-    pair = st.selectbox("Currency pair", list(PAIRS), index=0)
-    interval_label = st.selectbox("Timeframe", list(INTERVALS), index=1)
+    st.header("Market & strategy")
+    pair = st.selectbox("Forex pair", list(PAIRS.keys()))
+    interval_label = st.selectbox("Chart interval", list(INTERVALS.keys()), index=2)
     interval, period = INTERVALS[interval_label]
-    st.subheader("Signal strategy")
-    fast = st.slider("Fast moving average", 5, 30, 12)
-    slow = st.slider("Slow moving average", 20, 80, 32)
-    adx_floor = st.slider("Minimum ADX", 10, 40, 20)
-    atr_period = st.slider("ATR period", 5, 30, 14)
-    st.subheader("Paper risk controls")
-    initial_cash = st.number_input("Starting simulated balance ($)", 100.0, 1_000_000.0, 10000.0, 500.0)
-    risk_pct = st.slider("Risk budget per trade (%)", 0.1, 1.0, 0.5, 0.1)
-    stop_atr = st.slider("Stop distance (ATR multiple)", 0.5, 4.0, 1.5, 0.25)
-    target_r = st.slider("Take-profit multiple (R)", 0.5, 5.0, 2.0, 0.25)
-    spread_pips = st.slider("Assumed spread (pips)", 0.0, 5.0, 1.2, 0.1)
-    daily_loss_limit = st.slider("Daily loss pause threshold (%)", 0.5, 5.0, 2.0, 0.5)
-    max_dd_limit = st.slider("Max drawdown pause threshold (%)", 2.0, 25.0, 10.0, 1.0)
+    initial_cash = st.number_input("Starting balance (USD)", min_value=100.0, max_value=1_000_000.0, value=10000.0, step=500.0)
+    risk_pct = st.slider("Risk budget per trade (%)", 0.1, 2.0, 0.5, 0.1)
+    fast = st.slider("Fast SMA", 3, 50, 10)
+    slow = st.slider("Slow SMA", 10, 200, 30)
+    adx_min = st.slider("Minimum ADX", 5, 50, 20)
+    atr_period = st.slider("ATR period", 5, 40, 14)
+    adx_period = st.slider("ADX period", 5, 40, 14)
+    atr_stop = st.slider("Stop distance (ATR multiple)", 0.5, 5.0, 1.5, 0.25)
+    reward_risk = st.slider("Target / risk ratio", 0.5, 5.0, 2.0, 0.25)
+    spread_pips = st.number_input("Estimated spread (pips)", min_value=0.0, max_value=20.0, value=1.5, step=0.1)
+    max_daily_loss_pct = st.slider("Pause new trades at daily loss (%)", 1.0, 20.0, 5.0, 0.5)
+    max_drawdown_pct = st.slider("Pause new trades at drawdown (%)", 5.0, 50.0, 20.0, 1.0)
+    refresh = st.button("Refresh market data", type="primary")
 
+pip_size = 0.01 if pair.endswith("/JPY") else 0.0001
+
+@st.cache_data(ttl=60)
+def cached_fetch(ticker, interval, period, _refresh_token):
+    return fetch_data(ticker, interval, period)
+
+raw = cached_fetch(PAIRS[pair], interval, period, int(refresh))
+if raw.empty:
+    st.error("No market data was returned. Try another pair or interval, or refresh later.")
+    st.stop()
 if fast >= slow:
-    st.error("Fast moving average must be smaller than slow moving average.")
+    st.error("Fast SMA must be smaller than Slow SMA. Change the settings in the sidebar.")
     st.stop()
 
-with st.spinner(f"Loading {pair} data..."):
-    raw = fetch_data(PAIRS[pair], interval, period)
-if raw.empty or len(raw) < max(slow, atr_period, 50):
-    st.error("Market data is unavailable or there is not enough history for these settings. Try another pair or timeframe.")
+idata = indicators(raw, fast, slow, atr_period, adx_period)
+latest = idata.dropna(subset=["SMA_fast", "SMA_slow", "ATR", "ADX"])
+if latest.empty:
+    st.error("There is not enough data to calculate the indicators with these settings.")
     st.stop()
+last = latest.iloc[-1]
+if last["SMA_fast"] > last["SMA_slow"] and last["ADX"] >= adx_min:
+    signal_text = "LONG BIAS"
+elif last["SMA_fast"] < last["SMA_slow"] and last["ADX"] >= adx_min:
+    signal_text = "SHORT BIAS"
+else:
+    signal_text = "NO TRADE"
 
-pip_size = 0.01 if "JPY" in pair else 0.0001
-ind = calc_indicators(raw, fast, slow, 14, atr_period)
-ind["Signal"] = signals(ind, adx_floor)
-valid = ind.dropna(subset=["SMA_Fast", "SMA_Slow", "ATR", "ADX"]).copy()
-if len(valid) < 20:
-    st.error("Not enough valid indicator rows to analyze.")
-    st.stop()
+c1, c2, c3, c4 = st.columns(4)
+c1.metric(f"{pair} latest close", f"{last['Close']:.5f}" if not pair.endswith("/JPY") else f"{last['Close']:.3f}")
+c2.metric("Rule-based signal", signal_text)
+c3.metric("ADX", f"{last['ADX']:.1f}")
+c4.metric("ATR", f"{last['ATR']:.5f}" if not pair.endswith("/JPY") else f"{last['ATR']:.3f}")
+st.caption(f"Data timestamp: {latest.index[-1]} · Retrieved at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. A signal is an educational indicator, not a recommendation.")
 
-latest = valid.iloc[-1]
-bias = "BUY BIAS" if latest["Signal"] == 1 else "SELL BIAS" if latest["Signal"] == -1 else "NO TRADE"
-regime = "Trend filter passed" if latest["ADX"] >= adx_floor else "Weak/ranging conditions"
-atr_ratio = valid["ATR"] / valid["Close"]
-vol_state = "Elevated" if latest["ATR"] / latest["Close"] >= atr_ratio.quantile(.8) else "Typical"
+st.subheader("Price chart and moving averages")
+chart_df = idata[["Close", "SMA_fast", "SMA_slow"]].dropna().tail(500)
+st.line_chart(chart_df)
 
-a, b, c, d = st.columns(4)
-a.metric("Latest reference price", f"{latest['Close']:.5f}")
-b.metric("Rule-based signal", bias)
-c.metric("ADX", f"{latest['ADX']:.1f}", regime)
-d.metric("Volatility", vol_state, f"ATR {latest['ATR']:.5f}")
-
-st.subheader(f"{pair} price trend")
-st.line_chart(valid[["Close", "SMA_Fast", "SMA_Slow"]].tail(250), height=300)
-
-tab1, tab2, tab3, tab4 = st.tabs(["Backtest & risk", "Strategy review", "Paper monitor", "Data"])
-with tab1:
-    st.caption("OHLC-bar simulation with ATR stops/targets and position sizing based on a risk budget. It is still simplified and cannot reproduce real fills.")
-    curve, trades, cash, side, units, entry, stop, target = simulate(
-        valid, initial_cash, risk_pct, stop_atr, target_r, spread_pips, pip_size,
-        daily_loss_limit, max_dd_limit
-    )
-    if curve.empty:
-        st.info("Not enough rows to simulate.")
+st.subheader("Historical strategy simulation")
+trades_df, equity_df, stats = run_backtest(
+    idata, pair, initial_cash, risk_pct, fast, slow, adx_min, atr_stop,
+    reward_risk, spread_pips, pip_size, max_daily_loss_pct, max_drawdown_pct,
+)
+if "error" in stats:
+    st.info(stats["error"])
+else:
+    a, b, c, d = st.columns(4)
+    a.metric("Final simulated equity", f"${stats['Final equity']:,.2f}")
+    b.metric("Simulated return", f"{stats['Return %']:.2f}%")
+    c.metric("Closed trades", f"{stats['Trades']}")
+    d.metric("Max observed drawdown", f"{stats['Max observed drawdown %']:.2f}%")
+    st.caption("Model assumptions: next-candle-open entries; simplified ATR stops/targets; conservative stop-first rule if stop and target are both touched; estimated spread; no commissions, swaps, slippage, financing, margin calls, or broker execution effects. USD-base pair P&L is converted approximately using the exit/mark price. Results may differ materially from live trading.")
+    if not equity_df.empty:
+        st.line_chart(equity_df[["Equity"]])
+    if not trades_df.empty:
+        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+        st.download_button("Download trade log CSV", trades_df.to_csv(index=False).encode("utf-8"), file_name="forex_test_trades.csv", mime="text/csv")
     else:
-        end_equity = float(curve["Equity"].iloc[-1])
-        total_return = end_equity / initial_cash - 1
-        max_dd = float(curve["Drawdown %"].min())
-        wins = int((trades["P&L ($)"] > 0).sum()) if not trades.empty else 0
-        count = len(trades)
-        win_rate = wins / count * 100 if count else 0
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Ending simulated equity", f"${end_equity:,.2f}")
-        m2.metric("Net return", f"{total_return*100:.2f}%")
-        m3.metric("Max drawdown", f"{max_dd:.2f}%")
-        m4.metric("Closed trades / win rate", f"{count} / {win_rate:.1f}%")
-        st.line_chart(curve[["Equity"]], height=250)
-        if side:
-            st.info(f"Simulated open position: {'LONG' if side > 0 else 'SHORT'} • units {units:,.2f} • entry {entry:.5f} • stop {stop:.5f} • target {target:.5f}")
-        if not trades.empty:
-            st.dataframe(trades.tail(100), use_container_width=True)
-            st.download_button("Download trade log", trades.to_csv(index=False).encode(), "trade_log.csv", "text/csv")
-        else:
-            st.info("No closed simulated trades in this sample.")
-        st.download_button("Download equity curve", curve.to_csv().encode(), "equity_curve.csv", "text/csv")
+        st.info("No trades were closed during this simulation. Try a different pair, interval, or settings; do not optimize only for the best historical result.")
+    if not equity_df.empty:
+        st.download_button("Download equity curve CSV", equity_df.to_csv().encode("utf-8"), file_name="forex_test_equity.csv", mime="text/csv")
 
-with tab2:
-    st.subheader("Transparent strategy review")
-    st.write(f"**Current market classification:** {regime}; volatility is {vol_state.lower()}.")
-    if latest["Signal"] == 1:
-        st.write("The rule set has a bullish bias: fast SMA is above slow SMA and the ADX filter passes.")
-    elif latest["Signal"] == -1:
-        st.write("The rule set has a bearish bias: fast SMA is below slow SMA and the ADX filter passes.")
-    else:
-        st.write("No directional signal meets the selected rules.")
-    st.info("This is not yet a trained predictive AI. Version 2 focuses on transparent rules and more explicit simulated risk controls.")
-    if st.button("Research candidate settings"):
-        results = []
-        for f in [8, 12, 16]:
-            for s in [24, 32, 40]:
-                if f >= s: continue
-                for adx in [15, 20, 25]:
-                    candidate = calc_indicators(raw, f, s, 14, atr_period)
-                    candidate["Signal"] = signals(candidate, adx)
-                    candidate = candidate.dropna(subset=["SMA_Fast", "SMA_Slow", "ATR", "ADX"])
-                    if len(candidate) < 50: continue
-                    cv, tr, *_ = simulate(candidate, initial_cash, risk_pct, stop_atr, target_r,
-                                          spread_pips, pip_size, daily_loss_limit, max_dd_limit)
-                    if cv.empty: continue
-                    ret = cv["Equity"].iloc[-1] / initial_cash - 1
-                    dd = cv["Drawdown %"].min() / 100
-                    score = ret + 0.5 * dd
-                    results.append({"Fast SMA": f, "Slow SMA": s, "ADX floor": adx,
-                                    "Return %": ret*100, "Max drawdown %": dd*100,
-                                    "Research score": score})
-        if results:
-            table = pd.DataFrame(results).sort_values("Research score", ascending=False)
-            st.dataframe(table, use_container_width=True)
-            st.download_button("Download research candidates", table.to_csv(index=False).encode(),
-                               "candidate_settings.csv", "text/csv")
-            st.warning("Research scan results are vulnerable to overfitting. Do not automatically deploy the top row; test it on a separate untouched period and paper trade.")
-        else:
-            st.warning("No candidate results were available.")
+with st.expander("What this version can and cannot do"):
+    st.markdown("""
+    **It can:** download historical candles from Yahoo Finance, calculate SMA/ATR/ADX-style indicators, display a rule-based bias, and run a simplified historical simulation.
 
-with tab3:
-    st.subheader("Paper monitor — no real orders")
-    st.write("This view reports the latest rule-based state and a historical simulation summary. It does not run unattended in the background.")
-    st.metric("Latest rule-based state", bias)
-    st.metric("Reference time (data timestamp)", str(valid.index[-1]))
-    st.write("Risk guardrails used in backtest:")
-    st.write(f"- Risk budget per simulated trade: **{risk_pct:.2f}%** of simulated cash")
-    st.write(f"- Daily loss pause threshold: **{daily_loss_limit:.1f}%**")
-    st.write(f"- Drawdown pause threshold: **{max_dd_limit:.1f}%**")
-    st.write(f"- Stop: **{stop_atr:.2f} ATR** • Target: **{target_r:.2f}R**")
-    st.warning("These thresholds govern this historical simulation only; this page is not a persistent broker-connected paper account.")
+    **It cannot:** submit orders, connect to a broker, run continuously in the background, guarantee data quality, learn from trades, or guarantee profits. This is not yet an autonomous AI trader.
 
-with tab4:
-    st.dataframe(valid.tail(100).sort_index(ascending=False), use_container_width=True)
-    st.download_button("Download analyzed market data", valid.to_csv().encode(), "market_data.csv", "text/csv")
-
-st.divider()
-st.caption("Next planned stage: reliable data feed, persistent event-driven paper account, walk-forward validation, monitoring/alerts, then optional trained model evaluation. Live trading is intentionally excluded.")
+    **Next testing steps:** compare a few pairs and timeframes, inspect individual trades, test different historical periods, and use a broker demo/paper account separately before considering any live trading. Keep API keys and passwords out of this app and out of GitHub.
+    """)
